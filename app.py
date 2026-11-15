@@ -144,6 +144,10 @@ _LAYOUT_CSS = """
 header[data-testid="stHeader"] {
     background: transparent;
 }
+/* 데스크톱에서는 모바일 상단 메뉴를 숨긴다. */
+.mobile-nav {
+    display: none;
+}
 section[data-testid="stSidebar"] {
     margin-left: max(0px, calc((100vw - var(--board-frame-width)) / 2));
 }
@@ -168,12 +172,36 @@ main[data-testid="stMain"] div[data-testid="stMainBlockContainer"] {
     padding: 72px 32px 120px;
 }
 @media (max-width: 900px) {
+    :root {
+        --board-frame-width: 100vw;
+        --board-sidebar-width: 0px;
+    }
+    section[data-testid="stSidebar"] {
+        margin-left: 0;
+        display: none !important;
+    }
+    .mobile-nav {
+        display: block !important;
+    }
+    section[data-testid="stSidebar"][data-collapsed="true"] ~ * main[data-testid="stMain"] {
+        --board-main-width: 100vw;
+    }
+    main[data-testid="stMain"] {
+        --board-main-width: 100vw;
+        flex: 1 1 100%;
+        width: 100%;
+        max-width: 100%;
+        border-right: none;
+        margin: 0;
+    }
     main[data-testid="stMain"] div[data-testid="stMainBlockContainer"] {
-        padding: 64px 16px 96px;
+        padding: 56px 12px 80px;
     }
 }
+/* 데스크톱에서는 모바일 상단 메뉴를 숨긴다. (임시: 빈 화면 방지를 위해 :has 규칙 제거) */
 </style>
 """
+
 
 _DANGEROUS_SCHEMES = re.compile(
     r"(javascript|vbscript|data)\s*:", re.IGNORECASE
@@ -402,6 +430,67 @@ def _render_sidebar() -> str:
     return str(st.session_state.board)
 
 
+def _render_mobile_nav() -> None:
+    board_buttons = [("공지", "study"), ("사진", "family"), ("정보", "tips")]
+    with st.container():
+        st.markdown(
+            '<span class="mobile-nav-marker"></span>', unsafe_allow_html=True
+        )
+        if LOGO_PATH.exists():
+            st.image(str(LOGO_PATH), width=240)
+        columns = st.columns(3)
+        for index, (label, slug) in enumerate(board_buttons):
+            with columns[index]:
+                if st.button(
+                    label,
+                    key=f"mobile_board_{slug}",
+                    width=80,
+                ):
+                    st.session_state.board = slug
+                    st.session_state.page = 1
+                    st.session_state.route = "list"
+                    st.session_state.post_id = None
+                    st.session_state["list_search"] = ""
+                    st.rerun()
+    st.components.v1.html(
+        """
+        <script>
+        (function () {
+            const doc = window.parent.document;
+            function apply() {
+                const mobile = window.parent.innerWidth <= 900;
+                const sidebar = doc.querySelector('section[data-testid="stSidebar"]');
+                if (sidebar) sidebar.style.display = mobile ? 'none' : '';
+                const marker = doc.querySelector('.mobile-nav-marker');
+                if (marker) {
+                    let node = marker.parentElement;
+                    while (node && node !== doc.body) {
+                        if (node.getAttribute && node.getAttribute('data-testid') === 'stVerticalBlock') {
+                            node.style.display = mobile ? '' : 'none';
+                            const blocks = node.querySelectorAll('div[data-testid="stHorizontalBlock"]');
+                            blocks.forEach(function (block) {
+                                block.style.flexWrap = 'nowrap';
+                                block.style.overflow = 'visible';
+                                const cols = block.querySelectorAll('div[data-testid="stColumn"]');
+                                cols.forEach(function (col) {
+                                    col.style.minWidth = '0';
+                                    col.style.flex = '0 0 auto';
+                                });
+                            });
+                            break;
+                        }
+                        node = node.parentElement;
+                    }
+                }
+            }
+            apply();
+            window.parent.addEventListener('resize', apply);
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
 # ---------------------------------------------------------------------------
 # 목록 화면
 # ---------------------------------------------------------------------------
@@ -435,20 +524,14 @@ def render_list(board_slug: str) -> None:
         if st.button("새글", type="primary", width="stretch", key="new_post"):
             _go("write")
 
-    search_column, sort_column, size_column = st.columns(
-        [2.2, 1, 1], vertical_alignment="bottom"
-    )
-    keyword = search_column.text_input(
-        "검색", placeholder="제목 · 내용 · 작성자", key="list_search"
-    )
-    sort_label = sort_column.selectbox(
-        "정렬", tuple(board_db.SORT_OPTIONS.keys()), key="list_sort"
-    )
-    page_size = int(
-        size_column.selectbox(
-            "페이지당", PAGE_SIZE_OPTIONS, index=1, key="list_page_size"
-        )
-    )
+    keyword = st.session_state.get("list_search", "")
+    sort_options = list(board_db.SORT_OPTIONS.keys())
+    sort_label = st.session_state.get("list_sort", sort_options[0])
+    if sort_label not in board_db.SORT_OPTIONS:
+        sort_label = sort_options[0]
+    page_size = int(st.session_state.get("list_page_size", PAGE_SIZE_OPTIONS[1]))
+    if page_size not in PAGE_SIZE_OPTIONS:
+        page_size = PAGE_SIZE_OPTIONS[1]
 
     signature = f"{board_slug}|{keyword}|{sort_label}|{page_size}"
     if signature != st.session_state.filter_sig:
@@ -484,7 +567,6 @@ def render_list(board_slug: str) -> None:
             st.info("조건에 맞는 게시글이 없습니다. 검색어를 조정해 보세요.")
         else:
             st.info("이 게시판에는 아직 게시글이 없습니다. '새글'로 첫 글을 남겨 보세요.")
-        return
 
     for post in posts:
         with st.container(border=True):
@@ -538,6 +620,18 @@ def render_list(board_slug: str) -> None:
 
     _render_pagination(total_pages)
 
+    search_column, sort_column, size_column = st.columns(
+        [2.2, 1, 1], vertical_alignment="bottom"
+    )
+    search_column.text_input(
+        "검색", placeholder="제목 · 내용 · 작성자", key="list_search"
+    )
+    sort_column.selectbox(
+        "정렬", tuple(board_db.SORT_OPTIONS.keys()), key="list_sort"
+    )
+    size_column.selectbox(
+        "페이지당", PAGE_SIZE_OPTIONS, index=1, key="list_page_size"
+    )
 
 def _render_pagination(total_pages: int) -> None:
     if total_pages <= 1:
@@ -1037,6 +1131,7 @@ def main() -> None:
     _apply_branding()
 
     board_slug = _render_sidebar()
+    _render_mobile_nav()
 
     route = st.session_state.route
     if route == "detail":
