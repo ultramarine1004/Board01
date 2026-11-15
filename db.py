@@ -5,7 +5,10 @@ Streamlit에 의존하지 않는 순수 데이터 모듈이다. UI(app.py)에서
 
 Postgres(Neon 등) 사용: 환경변수 BOARD_DATABASE_URL 또는 DATABASE_URL,
 또는 Streamlit secrets의 DATABASE_URL 이 설정되면 Postgres 모드로 동작한다.
-설정되지 않으면 기존 SQLite( board/data/board.db )를 사용한다.
+BOARD_DB_PATH 가 설정되면 DATABASE_URL 이 있어도 해당 SQLite 파일을 사용한다.
+아무 것도 없으면 data/board.db (SQLite)를 사용한다.
+
+created_at/updated_at 은 UTC ISO 문자열로 저장하고, "오늘" 통계는 KST 기준이다.
 """
 
 from __future__ import annotations
@@ -37,6 +40,21 @@ def _resolve_database_url() -> str:
 
 DATABASE_URL: str = _resolve_database_url()
 USE_POSTGRES: bool = bool(DATABASE_URL)
+
+
+def _using_postgres(db_path: str | Path | None = None) -> bool:
+    """이번 호출이 실제로 Postgres 연결을 쓰는지 판단한다.
+
+    ``BOARD_DB_PATH`` 가 설정되면 DATABASE_URL 이 있어도 SQLite 를 쓴다.
+    (테스트·로컬 백업처럼 명시적으로 SQLite 파일을 지정하는 경우)
+    """
+    board_env = os.environ.get("BOARD_DB_PATH", "").strip()
+    return (db_path is None) and (not board_env) and USE_POSTGRES
+
+
+def is_postgres() -> bool:
+    """기본 연결(인자 없음)이 Postgres 를 사용하는지 반환한다."""
+    return _using_postgres(None)
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +128,7 @@ def _sql(sql: str) -> str:
 @contextmanager
 def connect(db_path: str | Path | None = None) -> Iterator[Any]:
     """트랜잭션 단위 커넥션을 열고 정상 종료 시 커밋한다."""
-    board_env = os.environ.get("BOARD_DB_PATH", "").strip()
-    use_pg = (db_path is None) and (not board_env) and USE_POSTGRES
+    use_pg = _using_postgres(db_path)
 
     if use_pg:
         import psycopg2
@@ -266,8 +283,7 @@ CREATE INDEX IF NOT EXISTS idx_post_images_post ON post_images(post_id, position
 
 def init_db(db_path: str | Path | None = None) -> None:
     """스키마를 생성한다. 여러 번 호출해도 안전하다(멱등)."""
-    board_env = os.environ.get("BOARD_DB_PATH", "").strip()
-    use_pg = (db_path is None) and (not board_env) and USE_POSTGRES
+    use_pg = _using_postgres(db_path)
     with connect(db_path) as conn:
         if use_pg:
             conn.execute(SCHEMA_SQL_PG)
@@ -436,7 +452,7 @@ def create_post(
         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
     """
     with connect(db_path) as conn:
-        if USE_POSTGRES:
+        if _using_postgres(db_path):
             cursor = conn.execute(_sql(sql + " RETURNING id"), params)
             return int(cursor.fetchone()["id"])
         cursor = conn.execute(_sql(sql), params)
@@ -667,7 +683,7 @@ def add_comment(
         if exists is None:
             raise PostNotFoundError("게시글을 찾을 수 없습니다.")
 
-        if USE_POSTGRES:
+        if _using_postgres(db_path):
             cursor = conn.execute(_sql(sql + " RETURNING id"), params)
             return int(cursor.fetchone()["id"])
         cursor = conn.execute(_sql(sql), params)
@@ -732,11 +748,12 @@ def add_post_images(
             raise PostNotFoundError("게시글을 찾을 수 없습니다.")
         start_row = conn.execute(
             _sql(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM post_images WHERE post_id = ?"
+                "SELECT COALESCE(MAX(position), -1) + 1 AS next_position"
+                " FROM post_images WHERE post_id = ?"
             ),
             (post_id,),
         ).fetchone()
-        start = int(start_row[0]) if start_row is not None else 0
+        start = int(start_row["next_position"]) if start_row is not None else 0
         timestamp = now_iso()
         conn.executemany(
             _sql(
@@ -832,13 +849,16 @@ def stats(
         where_posts = "WHERE p.board = ?"
         params = [_validate_board(board)]
 
-    board_env = os.environ.get("BOARD_DB_PATH", "").strip()
-    use_pg = (db_path is None) and (not board_env) and USE_POSTGRES
+    use_pg = _using_postgres(db_path)
 
+    # "오늘"은 한국 시간(KST) 기준으로 센다. created_at 은 UTC ISO 문자열이다.
     if use_pg:
-        date_today = "p.created_at::date = CURRENT_DATE"
+        date_today = (
+            "(p.created_at::timestamptz AT TIME ZONE 'Asia/Seoul')::date"
+            " = (now() AT TIME ZONE 'Asia/Seoul')::date"
+        )
     else:
-        date_today = "date(p.created_at) = date('now')"
+        date_today = "date(p.created_at, '+9 hours') = date('now', '+9 hours')"
 
     if board is None:
         where_today = f"WHERE {date_today}"
@@ -891,4 +911,37 @@ def all_posts_for_admin(
             """
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def export_all(db_path: str | Path | None = None) -> dict[str, Any]:
+    """전체 데이터를 백업용 딕셔너리로 내보낸다.
+
+    게시글·댓글·이미지 메타데이터를 모두 포함한다. 이미지 원본 파일은
+    포함되지 않으므로 ``data/uploads`` 폴더는 별도로 보관해야 한다.
+    """
+    with connect(db_path) as conn:
+        posts = [
+            dict(row)
+            for row in conn.execute("SELECT * FROM posts ORDER BY id").fetchall()
+        ]
+        comments = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM comments ORDER BY id"
+            ).fetchall()
+        ]
+        images = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM post_images ORDER BY post_id, position, id"
+            ).fetchall()
+        ]
+
+    return {
+        "exported_at": now_iso(),
+        "storage": "postgres" if _using_postgres(db_path) else "sqlite",
+        "posts": posts,
+        "comments": comments,
+        "post_images": images,
+    }
 path: db.py

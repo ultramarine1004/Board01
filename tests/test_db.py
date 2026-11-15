@@ -347,6 +347,23 @@ def test_admin_list_excludes_content(db_file: Path) -> None:
     assert rows[0]["comment_count"] == 0
 
 
+def test_export_all_includes_posts_comments_and_images(db_file: Path) -> None:
+    post_id = _create(db_file)
+    board_db.add_comment(
+        post_id, author="댓글러", content="백업 댓글", password="1234", db_path=db_file
+    )
+    board_db.add_post_images(post_id, [_image_meta("backup")], db_path=db_file)
+
+    data = board_db.export_all(db_path=db_file)
+
+    assert data["storage"] == "sqlite"
+    assert len(data["posts"]) == 1
+    assert data["posts"][0]["content"] == "테스트 내용입니다."
+    assert "password_hash" in data["posts"][0]
+    assert data["comments"][0]["content"] == "백업 댓글"
+    assert data["post_images"][0]["stored_name"] == "backup.jpg"
+
+
 # --- 사진 첨부 -------------------------------------------------------------
 
 

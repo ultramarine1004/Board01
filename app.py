@@ -1,19 +1,21 @@
-"""한줄게시판 - Streamlit UI.
+"""우리가족 게시판 - Streamlit UI.
 
 실행:
-    python -m streamlit run board/app.py
+    python -m streamlit run app.py
 
-데이터는 SQLite(board/data/board.db)에 저장된다. 상세 동작과 배포 주의사항은
-board/README.md 참고.
+데이터는 기본적으로 SQLite(data/board.db)에 저장되고, BOARD_DATABASE_URL /
+DATABASE_URL(또는 secrets)이 있으면 Postgres(Neon)를 사용한다.
+자세한 내용과 배포 주의사항은 README.md 참고.
 """
 
 from __future__ import annotations
 
 import hmac
+import json
 import math
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,9 +27,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db as board_db  # noqa: E402  (sys.path 설정 이후 import)
 import images as board_images  # noqa: E402
 
-APP_TITLE = "한줄게시판"
+APP_TITLE = "우리가족 게시판"
 DEFAULT_ADMIN_PASSWORD = "admin123"
 PAGE_SIZE_OPTIONS = (5, 10, 20)
+# 표시와 "오늘" 통계는 한국 시간(KST) 기준으로 맞춘다.
+KST = timezone(timedelta(hours=9))
 
 LOGO_PATH = Path(__file__).resolve().parent / "logos" / "hayun-story-logo.svg"
 BRAND_BG = "#FFF8F1"
@@ -130,7 +134,7 @@ _LAYOUT_CSS = """
 <style>
 :root {
     --board-sidebar-width: 300px;
-    --board-main-width: 1024px;
+    --board-main-width: min(1024px, calc(100vw - var(--board-sidebar-width)));
     --board-frame-width: 1324px;
 }
 [data-testid="stApp"],
@@ -147,11 +151,13 @@ section[data-testid="stSidebar"][data-collapsed="true"] {
     margin-left: 0;
 }
 section[data-testid="stSidebar"][data-collapsed="true"] ~ * main[data-testid="stMain"] {
+    --board-main-width: min(1024px, 100vw);
     margin-left: auto;
 }
 main[data-testid="stMain"] {
     flex: 0 0 var(--board-main-width);
     width: var(--board-main-width);
+    max-width: 100%;
     background-color: #ffffff;
     border-right: 1px solid #dcdedd;
     margin-right: auto;
@@ -160,6 +166,11 @@ main[data-testid="stMain"] div[data-testid="stMainBlockContainer"] {
     width: 100%;
     max-width: 100%;
     padding: 72px 32px 120px;
+}
+@media (max-width: 900px) {
+    main[data-testid="stMain"] div[data-testid="stMainBlockContainer"] {
+        padding: 64px 16px 96px;
+    }
 }
 </style>
 """
@@ -209,14 +220,25 @@ def _render_flash() -> None:
 
 
 def _fmt_time(iso_text: str) -> str:
-    """ISO-8601 UTC 문자열을 로컬 시간(YYYY-MM-DD HH:MM)으로 변환한다."""
+    """ISO-8601 UTC 문자열을 KST(YYYY-MM-DD HH:MM)로 변환한다."""
     try:
-        parsed = datetime.fromisoformat(iso_text)
+        parsed = datetime.fromisoformat(str(iso_text))
     except (TypeError, ValueError):
         return str(iso_text)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
+    return parsed.astimezone(KST).strftime("%Y-%m-%d %H:%M")
+
+
+def _fmt_badge_date(iso_text: str) -> str:
+    """목록 배지용 날짜(YY/MM/DD)를 KST 기준으로 만든다."""
+    try:
+        parsed = datetime.fromisoformat(str(iso_text))
+    except (TypeError, ValueError):
+        return str(iso_text)[:8]
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(KST).strftime("%y/%m/%d")
 
 
 def _escape_markdown(text: str) -> str:
@@ -236,6 +258,22 @@ def _admin_password() -> str:
     except (FileNotFoundError, KeyError, AttributeError, RuntimeError):
         return DEFAULT_ADMIN_PASSWORD
     return str(value) if value else DEFAULT_ADMIN_PASSWORD
+
+
+@st.cache_resource(show_spinner=False)
+def _ensure_schema(cache_key: str) -> None:
+    """스키마 초기화를 프로세스당 한 번만 실행한다.
+
+    ``cache_key`` 는 캐시를 DB(저장소)별로 구분하기 위한 값이다. Streamlit 은
+    rerun 마다 스크립트를 다시 실행하므로, 매번 DDL 을 Neon 에 보내지 않도록 한다.
+    """
+    board_db.init_db()
+
+
+def _schema_cache_key() -> str:
+    if board_db.is_postgres():
+        return "postgres"
+    return str(board_db.resolve_db_path())
 
 
 def _total_pages(total: int, page_size: int) -> int:
@@ -348,6 +386,8 @@ def _render_sidebar() -> str:
             st.session_state.page = 1
             st.session_state.route = "list"
             st.session_state.post_id = None
+            # 게시판을 바꾸면 이전 검색어가 남아 혼란을 주지 않도록 비운다.
+            st.session_state["list_search"] = ""
             st.rerun()
 
         st.divider()
@@ -458,7 +498,9 @@ def render_list(board_slug: str) -> None:
                 )
             else:
                 body_column = st.container()
-            title_label = ("📌 " if post["is_pinned"] else "") + str(post["title"])
+            title_label = (
+                "📌 " if post["is_pinned"] else ""
+            ) + _escape_markdown(str(post["title"]))
             meta_text = (
                 f"{post['author']} / {_fmt_time(post['created_at'])} / 조회 {post['views']}"
             )
@@ -467,10 +509,7 @@ def render_list(board_slug: str) -> None:
                 "tips": "#E3F2FD",
                 "study": "#E8F5E9",
             }.get(str(post.get("board") or "family"), "#F1F5F9")
-            try:
-                badge_date = datetime.fromisoformat(str(post["created_at"])).strftime("%y/%m/%d")
-            except (TypeError, ValueError):
-                badge_date = str(post["created_at"])[:8]
+            badge_date = _fmt_badge_date(str(post["created_at"]))
             badge_col, title_col, meta_col = body_column.columns(
                 [0.9, 5.1, 3], vertical_alignment="center"
             )
@@ -848,12 +887,19 @@ def render_admin() -> None:
         _go("list")
 
     if not st.session_state.admin_authed:
+        if _admin_password() == DEFAULT_ADMIN_PASSWORD:
+            st.warning(
+                "기본 관리자 비밀번호(admin123)를 사용 중입니다. "
+                ".streamlit/secrets.toml 의 admin_password 를 변경해 주세요."
+            )
         st.caption("관리자 비밀번호를 입력해 주세요.")
         with st.form("admin_login"):
             password = st.text_input("관리자 비밀번호", type="password")
             submitted = st.form_submit_button("로그인", type="primary")
             if submitted:
-                if hmac.compare_digest(password, _admin_password()):
+                if hmac.compare_digest(
+                    password.encode("utf-8"), _admin_password().encode("utf-8")
+                ):
                     st.session_state.admin_authed = True
                     st.rerun()
                 else:
@@ -875,21 +921,42 @@ def render_admin() -> None:
     metric_columns[1].metric("전체 댓글", f"{summary['total_comments']:,}개")
     metric_columns[2].metric("누적 조회", f"{summary['total_views']:,}회")
 
-    db_path = board_db.resolve_db_path()
     st.markdown("#### 데이터 백업")
-    st.caption(
-        "무료 호스팅은 서버가 재시작되면 파일이 사라질 수 있습니다. "
-        "주기적으로 백업 파일을 내려받아 보관하세요."
-    )
-    if db_path.exists():
-        st.download_button(
-            "SQLite 백업 다운로드",
-            data=db_path.read_bytes(),
-            file_name=f"board-backup-{datetime.now().strftime('%Y%m%d-%H%M')}.db",
-            mime="application/octet-stream",
+    if board_db.is_postgres():
+        st.caption(
+            "현재 Neon(Postgres)에 저장 중입니다. 이미지 원본 파일은 서버 디스크에 "
+            "따로 저장되므로 JSON 백업과 함께 보관해야 합니다."
         )
     else:
-        st.info("아직 데이터베이스 파일이 없습니다.")
+        db_path = board_db.resolve_db_path()
+        if db_path.exists():
+            st.download_button(
+                "SQLite 백업 다운로드",
+                data=db_path.read_bytes(),
+                file_name=(
+                    f"board-backup-{datetime.now(KST).strftime('%Y%m%d-%H%M')}.db"
+                ),
+                mime="application/octet-stream",
+                key="admin_sqlite_backup",
+            )
+        else:
+            st.info("아직 데이터베이스 파일이 없습니다.")
+
+    export_data = json.dumps(
+        board_db.export_all(), ensure_ascii=False, indent=2, default=str
+    ).encode("utf-8")
+    st.download_button(
+        "JSON 백업 다운로드 (게시글·댓글·이미지 정보)",
+        data=export_data,
+        file_name=(
+            f"board-export-{datetime.now(KST).strftime('%Y%m%d-%H%M')}.json"
+        ),
+        mime="application/json",
+        key="admin_json_backup",
+    )
+    st.caption(
+        "비밀번호는 해시 형태로 포함됩니다. 백업 파일은 안전한 곳에 보관하세요."
+    )
 
     posts = board_db.all_posts_for_admin()
     st.markdown("#### 게시글 관리")
@@ -935,16 +1002,22 @@ def render_admin() -> None:
         st.rerun()
     if open_column.button("열기", width="stretch"):
         _go("detail", selected_id)
+    delete_confirmed = delete_column.checkbox(
+        "삭제 확인", key=f"admin_del_ok_{selected_id}"
+    )
     if delete_column.button("삭제", type="primary", width="stretch"):
-        attached = board_db.list_post_images(selected_id)
-        try:
-            board_db.admin_delete_post(selected_id)
-        except board_db.PostNotFoundError as error:
-            st.error(str(error))
+        if not delete_confirmed:
+            st.error("삭제하려면 '삭제 확인'에 체크해 주세요.")
         else:
-            board_images.delete_files(_image_file_names(attached))
-            _flash("게시글을 삭제했습니다.", "🗑️")
-            st.rerun()
+            attached = board_db.list_post_images(selected_id)
+            try:
+                board_db.admin_delete_post(selected_id)
+            except board_db.PostNotFoundError as error:
+                st.error(str(error))
+            else:
+                board_images.delete_files(_image_file_names(attached))
+                _flash("게시글을 삭제했습니다.", "🗑️")
+                st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -958,7 +1031,7 @@ def main() -> None:
         page_icon="📌",
         layout="wide",
     )
-    board_db.init_db()
+    _ensure_schema(_schema_cache_key())
     _init_state()
     _render_flash()
     _apply_branding()

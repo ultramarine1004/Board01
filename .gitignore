@@ -1,6 +1,10 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.omo/
+*.log
 data/*.db
 data/*.db-journal
+data/uploads/
 .streamlit/secrets.toml

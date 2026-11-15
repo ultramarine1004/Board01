@@ -19,12 +19,15 @@ sys.path.insert(0, str(BOARD_DIR))
 import db as board_db
 
 BOARD_LABELS = [board_db.BOARDS[slug] for slug in board_db.BOARDS]
+TEST_ADMIN_PASSWORD = "test-admin-1234"
 
 
 @pytest.fixture()
 def at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppTest:
     monkeypatch.setenv("BOARD_DB_PATH", str(tmp_path / "smoke.db"))
     app = AppTest.from_file(str(APP_PATH), default_timeout=60)
+    # 개발자 PC의 secrets.toml 과 무관하게 항상 같은 비밀번호로 테스트한다.
+    app.secrets["admin_password"] = TEST_ADMIN_PASSWORD
     app.run()
     return app
 
@@ -118,7 +121,7 @@ def test_admin_login_and_delete(at: AppTest) -> None:
     at.run()
 
     _click(at, "⚙️ 관리자")
-    _input(at, "관리자 비밀번호").set_value("admin123")
+    _input(at, "관리자 비밀번호").set_value(TEST_ADMIN_PASSWORD)
     _click(at, "로그인")
 
     assert at.session_state["admin_authed"] is True
@@ -128,6 +131,7 @@ def test_admin_login_and_delete(at: AppTest) -> None:
     )
     assert in_table
 
+    at.checkbox(key=f"admin_del_ok_{post_id}").check().run()
     _click(at, "삭제")
     assert board_db.get_post(post_id) is None
 
@@ -186,6 +190,16 @@ def test_new_post_goes_to_selected_board(at: AppTest) -> None:
     post = board_db.get_post(int(at.session_state["post_id"]))
     assert post is not None
     assert post["board"] == "study"
+
+
+def test_board_switch_clears_search_box(at: AppTest) -> None:
+    at.text_input(key="list_search").set_value("가족").run()
+    assert at.session_state["list_search"] == "가족"
+
+    at.radio[0].set_value(board_db.BOARDS["study"]).run()
+
+    assert at.session_state["list_search"] == ""
+    assert at.text_input(key="list_search").value == ""
 
 
 def test_comment_form_adds_comment(at: AppTest) -> None:

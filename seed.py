@@ -1,9 +1,11 @@
 """샘플 데이터 시딩 스크립트.
 
 사용:
-    python board/seed.py
+    python seed.py
 
-이미 게시글이 있으면 아무 것도 하지 않는다(멱등).
+DATABASE_URL(또는 secrets.toml)이 설정되어 있으면 그 Postgres(Neon)에,
+아니면 로컬 SQLite(data/board.db)에 넣는다. 이미 게시글이 있으면 아무 것도
+하지 않는다(멱등).
 """
 
 from __future__ import annotations
@@ -118,6 +120,9 @@ SAMPLE_COMMENTS: list[tuple[int, str, str]] = [
 
 
 def seed(db_path: str | Path | None = None) -> None:
+    if board_db.is_postgres():
+        print("Postgres(Neon)에 시딩합니다. 로컬 SQLite 파일은 건드리지 않습니다.")
+
     board_db.init_db(db_path)
 
     _, existing = board_db.list_posts(page=1, page_size=1, db_path=db_path)
