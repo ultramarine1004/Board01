@@ -1,7 +1,11 @@
-"""한줄게시판 - SQLite 데이터 접근 계층.
+"""게시판 - SQLite/Postgres 데이터 접근 계층.
 
-Streamlit 에 의존하지 않는 순수 파이썬 모듈이다. UI 는 app.py 에서 이 모듈을 호출한다.
-모든 SQL 은 파라미터 바인딩(?)을 사용하며, 비밀번호는 평문으로 저장하지 않는다.
+Streamlit에 의존하지 않는 순수 데이터 모듈이다. UI(app.py)에서 이 모듈을 호출한다.
+모든 SQL은 파라미터 바인딩(?)을 사용하며, 비밀번호는 해시로만 저장한다.
+
+Postgres(Neon 등) 사용: 환경변수 BOARD_DATABASE_URL 또는 DATABASE_URL,
+또는 Streamlit secrets의 DATABASE_URL 이 설정되면 Postgres 모드로 동작한다.
+설정되지 않으면 기존 SQLite( board/data/board.db )를 사용한다.
 """
 
 from __future__ import annotations
@@ -16,6 +20,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+
+def _resolve_database_url() -> str:
+    url = os.environ.get("BOARD_DATABASE_URL", "").strip()
+    if not url:
+        url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        try:
+            import streamlit as st
+
+            url = str(st.secrets.get("DATABASE_URL", "")).strip()
+        except Exception:
+            pass
+    return url
+
+
+DATABASE_URL: str = _resolve_database_url()
+USE_POSTGRES: bool = bool(DATABASE_URL)
+
+
 # ---------------------------------------------------------------------------
 # 상수
 # ---------------------------------------------------------------------------
@@ -25,9 +48,9 @@ DEFAULT_CATEGORY: str = "자유"
 ALL_CATEGORY: str = "전체"
 
 BOARDS: dict[str, str] = {
-    "family": "우리 가족 사진",
-    "tips": "알아주면 좋은 정보팁",
-    "study": "공부합시다",
+    "family": "우리 가족 게시판",
+    "tips": "알아두면 좋은 정보",
+    "study": "공지사항",
 }
 DEFAULT_BOARD: str = "family"
 BOARD_LABELS: tuple[str, ...] = tuple(BOARDS.values())
@@ -79,12 +102,66 @@ def resolve_db_path(db_path: str | Path | None = None) -> Path:
     return DEFAULT_DB_PATH
 
 
+def _sql(sql: str) -> str:
+    """Postgres 연결 래퍼에서 플레이스홀더를 변환하므로 여기서는 그대로 반환한다."""
+    return sql
+
+
 @contextmanager
-def connect(db_path: str | Path | None = None) -> Iterator[sqlite3.Connection]:
+def connect(db_path: str | Path | None = None) -> Iterator[Any]:
     """트랜잭션 단위 커넥션을 열고 정상 종료 시 커밋한다."""
+    board_env = os.environ.get("BOARD_DB_PATH", "").strip()
+    use_pg = (db_path is None) and (not board_env) and USE_POSTGRES
+
+    if use_pg:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+
+        raw = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+        class _PgConnection:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, params=None):
+                cur = self._inner.cursor()
+                if isinstance(sql, str):
+                    sql = sql.replace("?", "%s")
+                if params is None:
+                    cur.execute(sql)
+                else:
+                    cur.execute(sql, params)
+                return cur
+
+            def executemany(self, sql, params_seq):
+                cur = self._inner.cursor()
+                if isinstance(sql, str):
+                    sql = sql.replace("?", "%s")
+                cur.executemany(sql, params_seq)
+                return cur
+
+            def commit(self):
+                self._inner.commit()
+
+            def rollback(self):
+                self._inner.rollback()
+
+            def close(self):
+                self._inner.close()
+
+        conn = _PgConnection(raw)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return
+
     path = resolve_db_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-
     conn = sqlite3.connect(str(path), timeout=5.0)
     conn.row_factory = sqlite3.Row
     try:
@@ -143,27 +220,89 @@ CREATE INDEX IF NOT EXISTS idx_post_images_post ON post_images(post_id, position
 """
 
 
+SCHEMA_SQL_PG: str = """
+CREATE TABLE IF NOT EXISTS posts (
+    id            SERIAL PRIMARY KEY,
+    board         TEXT    NOT NULL DEFAULT 'family',
+    category      TEXT    NOT NULL DEFAULT '자유',
+    title         TEXT    NOT NULL,
+    author        TEXT    NOT NULL,
+    content       TEXT    NOT NULL,
+    password_hash TEXT    NOT NULL,
+    views         INTEGER NOT NULL DEFAULT 0,
+    is_pinned     INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT    NOT NULL,
+    updated_at    TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS comments (
+    id            SERIAL PRIMARY KEY,
+    post_id       INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    author        TEXT    NOT NULL,
+    content       TEXT    NOT NULL,
+    password_hash TEXT    NOT NULL,
+    created_at    TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS post_images (
+    id          SERIAL PRIMARY KEY,
+    post_id     INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    stored_name TEXT    NOT NULL UNIQUE,
+    thumb_name  TEXT    NOT NULL,
+    mime        TEXT    NOT NULL,
+    width       INTEGER NOT NULL,
+    height      INTEGER NOT NULL,
+    byte_size   INTEGER NOT NULL,
+    position    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_category   ON posts(category);
+CREATE INDEX IF NOT EXISTS idx_comments_post_id ON comments(post_id);
+CREATE INDEX IF NOT EXISTS idx_post_images_post ON post_images(post_id, position);
+"""
+
+
 def init_db(db_path: str | Path | None = None) -> None:
     """스키마를 생성한다. 여러 번 호출해도 안전하다(멱등)."""
+    board_env = os.environ.get("BOARD_DB_PATH", "").strip()
+    use_pg = (db_path is None) and (not board_env) and USE_POSTGRES
     with connect(db_path) as conn:
-        conn.executescript(SCHEMA_SQL)
-        _migrate_schema(conn)
+        if use_pg:
+            conn.execute(SCHEMA_SQL_PG)
+        else:
+            conn.executescript(SCHEMA_SQL)
+        _migrate_schema(conn, use_pg=use_pg)
 
 
-def _migrate_schema(conn: sqlite3.Connection) -> None:
-    """게시판(board) 컬럼이 없는 기존 DB 를 현재 스키마로 승격한다.
-
-    ALTER TABLE ADD COLUMN 은 기본값만 채우므로 기존 글은 기본 게시판으로
-    이동하고 데이터는 그대로 보존된다.
-    """
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(posts)")}
-    if "board" not in columns:
+def _migrate_schema(conn: Any, use_pg: bool = False) -> None:
+    """기존 DB에 board 컬럼이 없으면 추가한다."""
+    if use_pg:
         conn.execute(
-            "ALTER TABLE posts ADD COLUMN board TEXT NOT NULL DEFAULT 'family'"
+            """
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='posts' AND column_name='board'
+                ) THEN
+                    ALTER TABLE posts ADD COLUMN board TEXT NOT NULL DEFAULT 'family';
+                END IF;
+            END $$;
+            """
         )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_posts_board ON posts(board, created_at DESC)"
-    )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_posts_board ON posts(board, created_at DESC)"
+        )
+    else:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(posts)")}
+        if "board" not in columns:
+            conn.execute(
+                "ALTER TABLE posts ADD COLUMN board TEXT NOT NULL DEFAULT 'family'"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_posts_board ON posts(board, created_at DESC)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +331,7 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
-    """해시와 비밀번호를 상수 시간 비교로 검증한다."""
+    """입력 비밀번호를 저장된 해시와 상수 시간 비교로 검증한다."""
     try:
         algorithm, iterations, salt_hex, digest_hex = stored_hash.split("$")
         if algorithm != _HASH_ALGORITHM:
@@ -242,7 +381,7 @@ def _validate_board(board: str) -> str:
 
 
 def board_label(board: str) -> str:
-    """게시판 slug 를 화면에 보여줄 이름으로 바꾼다."""
+    """게시판 slug 를 보여줄 이름으로 바꾼다."""
     return BOARDS.get(board, BOARDS[DEFAULT_BOARD])
 
 
@@ -279,26 +418,28 @@ def create_post(
     password = _validate_password(password)
 
     timestamp = now_iso()
+    params = (
+        board,
+        category,
+        title,
+        author,
+        content,
+        hash_password(password),
+        1 if is_pinned else 0,
+        timestamp,
+        timestamp,
+    )
+    sql = """
+        INSERT INTO posts
+            (board, category, title, author, content, password_hash,
+             views, is_pinned, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+    """
     with connect(db_path) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO posts
-                (board, category, title, author, content, password_hash,
-                 views, is_pinned, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-            """,
-            (
-                board,
-                category,
-                title,
-                author,
-                content,
-                hash_password(password),
-                1 if is_pinned else 0,
-                timestamp,
-                timestamp,
-            ),
-        )
+        if USE_POSTGRES:
+            cursor = conn.execute(_sql(sql + " RETURNING id"), params)
+            return int(cursor.fetchone()["id"])
+        cursor = conn.execute(_sql(sql), params)
         return int(cursor.lastrowid)
 
 
@@ -308,13 +449,15 @@ def get_post(
     """게시글 한 건을 조회한다. 없으면 ``None``."""
     with connect(db_path) as conn:
         row = conn.execute(
-            """
-            SELECT p.*,
-                   (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id)
-                       AS comment_count
-            FROM posts p
-            WHERE p.id = ?
-            """,
+            _sql(
+                """
+                SELECT p.*,
+                       (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id)
+                           AS comment_count
+                FROM posts p
+                WHERE p.id = ?
+                """
+            ),
             (post_id,),
         ).fetchone()
     return dict(row) if row else None
@@ -371,14 +514,7 @@ def list_posts(
     board: str | None = None,
     db_path: str | Path | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    """게시글 목록과 전체 건수를 반환한다.
-
-    Args:
-        board: 게시판 slug. ``None`` 이면 모든 게시판을 대상으로 한다.
-
-    Returns:
-        (현재 페이지 게시글 목록, 필터 적용 후 전체 건수)
-    """
+    """게시글 목록과 전체 건수를 반환한다."""
     page = max(1, int(page))
     page_size = max(1, min(int(page_size), 100))
     order_by = _ORDER_BY.get(sort, _ORDER_BY[SORT_LATEST])
@@ -386,26 +522,28 @@ def list_posts(
 
     with connect(db_path) as conn:
         total_row = conn.execute(
-            f"SELECT COUNT(*) AS cnt FROM posts p {where}", params
+            _sql(f"SELECT COUNT(*) AS cnt FROM posts p {where}"), params
         ).fetchone()
         total = int(total_row["cnt"]) if total_row else 0
 
         rows = conn.execute(
-            f"""
-            SELECT p.*,
-                   (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id)
-                       AS comment_count,
-                   (SELECT COUNT(*) FROM post_images i WHERE i.post_id = p.id)
-                       AS image_count,
-                   (SELECT i.thumb_name FROM post_images i
-                     WHERE i.post_id = p.id
-                     ORDER BY i.position ASC, i.id ASC LIMIT 1)
-                       AS thumb_name
-            FROM posts p
-            {where}
-            ORDER BY {order_by}
-            LIMIT ? OFFSET ?
-            """,
+            _sql(
+                f"""
+                SELECT p.*,
+                       (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id)
+                           AS comment_count,
+                       (SELECT COUNT(*) FROM post_images i WHERE i.post_id = p.id)
+                           AS image_count,
+                       (SELECT i.thumb_name FROM post_images i
+                         WHERE i.post_id = p.id
+                         ORDER BY i.position ASC, i.id ASC LIMIT 1)
+                           AS thumb_name
+                FROM posts p
+                {where}
+                ORDER BY {order_by}
+                LIMIT ? OFFSET ?
+                """
+            ),
             [*params, page_size, (page - 1) * page_size],
         ).fetchall()
 
@@ -428,7 +566,7 @@ def update_post(
 
     with connect(db_path) as conn:
         row = conn.execute(
-            "SELECT password_hash FROM posts WHERE id = ?", (post_id,)
+            _sql("SELECT password_hash FROM posts WHERE id = ?"), (post_id,)
         ).fetchone()
         if row is None:
             raise PostNotFoundError("게시글을 찾을 수 없습니다.")
@@ -436,11 +574,13 @@ def update_post(
             raise PermissionError("비밀번호가 일치하지 않습니다.")
 
         conn.execute(
-            """
-            UPDATE posts
-               SET category = ?, title = ?, content = ?, updated_at = ?
-             WHERE id = ?
-            """,
+            _sql(
+                """
+                UPDATE posts
+                   SET category = ?, title = ?, content = ?, updated_at = ?
+                 WHERE id = ?
+                """
+            ),
             (category, title, content, now_iso(), post_id),
         )
 
@@ -451,16 +591,16 @@ def delete_post(
     password: str,
     db_path: str | Path | None = None,
 ) -> None:
-    """비밀번호가 일치할 때만 게시글을 삭제한다(댓글은 CASCADE)."""
+    """비밀번호가 일치할 때만 게시글을 삭제한다(댓글 CASCADE)."""
     with connect(db_path) as conn:
         row = conn.execute(
-            "SELECT password_hash FROM posts WHERE id = ?", (post_id,)
+            _sql("SELECT password_hash FROM posts WHERE id = ?"), (post_id,)
         ).fetchone()
         if row is None:
             raise PostNotFoundError("게시글을 찾을 수 없습니다.")
         if not verify_password(password, row["password_hash"]):
             raise PermissionError("비밀번호가 일치하지 않습니다.")
-        conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
+        conn.execute(_sql("DELETE FROM posts WHERE id = ?"), (post_id,))
 
 
 def admin_delete_post(
@@ -468,7 +608,7 @@ def admin_delete_post(
 ) -> None:
     """관리자 권한으로 비밀번호 없이 게시글을 삭제한다."""
     with connect(db_path) as conn:
-        cursor = conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
+        cursor = conn.execute(_sql("DELETE FROM posts WHERE id = ?"), (post_id,))
         if cursor.rowcount == 0:
             raise PostNotFoundError("게시글을 찾을 수 없습니다.")
 
@@ -477,7 +617,7 @@ def increment_views(post_id: int, db_path: str | Path | None = None) -> None:
     """조회수를 1 증가시킨다."""
     with connect(db_path) as conn:
         conn.execute(
-            "UPDATE posts SET views = views + 1 WHERE id = ?", (post_id,)
+            _sql("UPDATE posts SET views = views + 1 WHERE id = ?"), (post_id,)
         )
 
 
@@ -489,7 +629,7 @@ def set_pinned(
     """게시글 상단 고정 여부를 변경한다(관리자용)."""
     with connect(db_path) as conn:
         cursor = conn.execute(
-            "UPDATE posts SET is_pinned = ? WHERE id = ?",
+            _sql("UPDATE posts SET is_pinned = ? WHERE id = ?"),
             (1 if pinned else 0, post_id),
         )
         if cursor.rowcount == 0:
@@ -514,35 +654,40 @@ def add_comment(
     content = _validate_text(content, field="댓글", max_length=MAX_COMMENT)
     password = _validate_password(password)
 
+    timestamp = now_iso()
+    params = (post_id, author, content, hash_password(password), timestamp)
+    sql = """
+        INSERT INTO comments (post_id, author, content, password_hash, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """
     with connect(db_path) as conn:
         exists = conn.execute(
-            "SELECT 1 FROM posts WHERE id = ?", (post_id,)
+            _sql("SELECT 1 FROM posts WHERE id = ?"), (post_id,)
         ).fetchone()
         if exists is None:
             raise PostNotFoundError("게시글을 찾을 수 없습니다.")
 
-        cursor = conn.execute(
-            """
-            INSERT INTO comments (post_id, author, content, password_hash, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (post_id, author, content, hash_password(password), now_iso()),
-        )
+        if USE_POSTGRES:
+            cursor = conn.execute(_sql(sql + " RETURNING id"), params)
+            return int(cursor.fetchone()["id"])
+        cursor = conn.execute(_sql(sql), params)
         return int(cursor.lastrowid)
 
 
 def list_comments(
     post_id: int, db_path: str | Path | None = None
 ) -> list[dict[str, Any]]:
-    """게시글의 댓글을 오래된 순으로 반환한다."""
+    """게시글의 댓글을 시간순으로 반환한다."""
     with connect(db_path) as conn:
         rows = conn.execute(
-            """
-            SELECT id, post_id, author, content, created_at
-            FROM comments
-            WHERE post_id = ?
-            ORDER BY created_at ASC, id ASC
-            """,
+            _sql(
+                """
+                SELECT id, post_id, author, content, created_at
+                FROM comments
+                WHERE post_id = ?
+                ORDER BY created_at ASC, id ASC
+                """
+            ),
             (post_id,),
         ).fetchall()
     return [dict(row) for row in rows]
@@ -557,17 +702,17 @@ def delete_comment(
     """비밀번호가 일치할 때만 댓글을 삭제한다."""
     with connect(db_path) as conn:
         row = conn.execute(
-            "SELECT password_hash FROM comments WHERE id = ?", (comment_id,)
+            _sql("SELECT password_hash FROM comments WHERE id = ?"), (comment_id,)
         ).fetchone()
         if row is None:
             raise PostNotFoundError("댓글을 찾을 수 없습니다.")
         if not verify_password(password, row["password_hash"]):
             raise PermissionError("비밀번호가 일치하지 않습니다.")
-        conn.execute("DELETE FROM comments WHERE id = ?", (comment_id,))
+        conn.execute(_sql("DELETE FROM comments WHERE id = ?"), (comment_id,))
 
 
 # ---------------------------------------------------------------------------
-# 사진 첨부
+# 이미지 첨부
 # ---------------------------------------------------------------------------
 
 
@@ -576,29 +721,32 @@ def add_post_images(
     images: list[dict[str, Any]],
     db_path: str | Path | None = None,
 ) -> None:
-    """이미 저장된 사진 파일들의 메타데이터를 게시글에 연결한다."""
+    """이미 업로드된 이미지 파일의 메타데이터를 게시글에 연결한다."""
     if not images:
         return
     with connect(db_path) as conn:
         exists = conn.execute(
-            "SELECT 1 FROM posts WHERE id = ?", (post_id,)
+            _sql("SELECT 1 FROM posts WHERE id = ?"), (post_id,)
         ).fetchone()
         if exists is None:
             raise PostNotFoundError("게시글을 찾을 수 없습니다.")
-        start = int(
-            conn.execute(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM post_images WHERE post_id = ?",
-                (post_id,),
-            ).fetchone()[0]
-        )
+        start_row = conn.execute(
+            _sql(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM post_images WHERE post_id = ?"
+            ),
+            (post_id,),
+        ).fetchone()
+        start = int(start_row[0]) if start_row is not None else 0
         timestamp = now_iso()
         conn.executemany(
-            """
-            INSERT INTO post_images
-                (post_id, stored_name, thumb_name, mime, width, height,
-                 byte_size, position, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            _sql(
+                """
+                INSERT INTO post_images
+                    (post_id, stored_name, thumb_name, mime, width, height,
+                     byte_size, position, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+            ),
             [
                 (
                     post_id,
@@ -619,16 +767,18 @@ def add_post_images(
 def list_post_images(
     post_id: int, db_path: str | Path | None = None
 ) -> list[dict[str, Any]]:
-    """게시글에 연결된 사진을 등록 순서대로 반환한다."""
+    """게시글에 연결된 이미지 목록을 반환한다."""
     with connect(db_path) as conn:
         rows = conn.execute(
-            """
-            SELECT id, post_id, stored_name, thumb_name, mime, width, height,
-                   byte_size, position, created_at
-            FROM post_images
-            WHERE post_id = ?
-            ORDER BY position ASC, id ASC
-            """,
+            _sql(
+                """
+                SELECT id, post_id, stored_name, thumb_name, mime, width, height,
+                       byte_size, position, created_at
+                FROM post_images
+                WHERE post_id = ?
+                ORDER BY position ASC, id ASC
+                """
+            ),
             (post_id,),
         ).fetchall()
     return [dict(row) for row in rows]
@@ -637,16 +787,16 @@ def list_post_images(
 def delete_post_image(
     image_id: int, post_id: int, db_path: str | Path | None = None
 ) -> dict[str, Any] | None:
-    """게시글에 속한 사진 한 장을 삭제하고 그 메타데이터를 반환한다."""
+    """게시글에 연결된 이미지 메타데이터를 삭제하고 반환한다."""
     with connect(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM post_images WHERE id = ? AND post_id = ?",
+            _sql("SELECT * FROM post_images WHERE id = ? AND post_id = ?"),
             (image_id, post_id),
         ).fetchone()
         if row is None:
             return None
         conn.execute(
-            "DELETE FROM post_images WHERE id = ? AND post_id = ?",
+            _sql("DELETE FROM post_images WHERE id = ? AND post_id = ?"),
             (image_id, post_id),
         )
     return dict(row)
@@ -674,33 +824,44 @@ def list_categories(db_path: str | Path | None = None) -> list[tuple[str, int]]:
 def stats(
     board: str | None = None, db_path: str | Path | None = None
 ) -> dict[str, int]:
-    """대시보드용 요약 지표를 반환한다.
-
-    Args:
-        board: 게시판 slug. ``None`` 이면 전체 게시판 합계를 센다.
-    """
+    """대시보드용 요약 지표를 반환한다."""
     if board is None:
         where_posts = ""
-        where_today = "WHERE date(p.created_at) = date('now')"
         params: list[Any] = []
     else:
         where_posts = "WHERE p.board = ?"
-        where_today = "WHERE p.board = ? AND date(p.created_at) = date('now')"
         params = [_validate_board(board)]
+
+    board_env = os.environ.get("BOARD_DB_PATH", "").strip()
+    use_pg = (db_path is None) and (not board_env) and USE_POSTGRES
+
+    if use_pg:
+        date_today = "p.created_at::date = CURRENT_DATE"
+    else:
+        date_today = "date(p.created_at) = date('now')"
+
+    if board is None:
+        where_today = f"WHERE {date_today}"
+    else:
+        where_today = f"WHERE p.board = ? AND {date_today}"
+
+    today_params = [_validate_board(board)] if board is not None else []
 
     with connect(db_path) as conn:
         row = conn.execute(
-            f"""
-            SELECT
-                (SELECT COUNT(*) FROM posts p {where_posts}) AS total_posts,
-                (SELECT COUNT(*) FROM comments c
-                   JOIN posts p ON p.id = c.post_id {where_posts})
-                    AS total_comments,
-                (SELECT COUNT(*) FROM posts p {where_today}) AS posts_today,
-                (SELECT COALESCE(SUM(p.views), 0) FROM posts p {where_posts})
-                    AS total_views
-            """,
-            [*params, *params, *params, *params],
+            _sql(
+                f"""
+                SELECT
+                    (SELECT COUNT(*) FROM posts p {where_posts}) AS total_posts,
+                    (SELECT COUNT(*) FROM comments c
+                       JOIN posts p ON p.id = c.post_id {where_posts})
+                        AS total_comments,
+                    (SELECT COUNT(*) FROM posts p {where_today}) AS posts_today,
+                    (SELECT COALESCE(SUM(p.views), 0) FROM posts p {where_posts})
+                        AS total_views
+                """
+            ),
+            [*params, *params, *today_params, *params],
         ).fetchone()
     if row is None:
         return {"total_posts": 0, "total_comments": 0, "posts_today": 0, "total_views": 0}
@@ -730,3 +891,4 @@ def all_posts_for_admin(
             """
         ).fetchall()
     return [dict(row) for row in rows]
+path: db.py
