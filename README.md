@@ -1,4 +1,4 @@
-# 한줄게시판 (Streamlit + SQLite)
+# 우리가족 게시판 (Streamlit + SQLite)
 
 Python 만으로 5분 안에 띄우는 최소 게시판입니다. Streamlit UI, SQLite 저장소,
 비밀번호 기반 수정·삭제, 댓글, 검색, 페이지네이션, 관리자 모드를 포함합니다.
