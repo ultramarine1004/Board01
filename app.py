@@ -462,7 +462,25 @@ def render_list(board_slug: str) -> None:
             meta_text = (
                 f"{post['author']} / {_fmt_time(post['created_at'])} / 조회 {post['views']}"
             )
-            title_col, meta_col = body_column.columns([7, 3], vertical_alignment="center")
+            badge_color = {
+                "family": "#FCE4EC",
+                "tips": "#E3F2FD",
+                "study": "#E8F5E9",
+            }.get(str(post.get("board") or "family"), "#F1F5F9")
+            try:
+                badge_date = datetime.fromisoformat(str(post["created_at"])).strftime("%y/%m/%d")
+            except (TypeError, ValueError):
+                badge_date = str(post["created_at"])[:8]
+            badge_col, title_col, meta_col = body_column.columns(
+                [0.9, 5.1, 3], vertical_alignment="center"
+            )
+            badge_col.markdown(
+                f"<div style='background:{badge_color};color:#333;padding:2px 6px;"
+                f"border-radius:6px;font-size:12px;text-align:center;"
+                f"white-space:nowrap;font-family:NanumSquareNeo,sans-serif;'>"
+                f"{badge_date}</div>",
+                unsafe_allow_html=True,
+            )
             if title_col.button(
                 title_label,
                 key=f"open_{post['id']}",
