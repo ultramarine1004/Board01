@@ -475,10 +475,11 @@ def render_list(board_slug: str) -> None:
                 [0.9, 5.1, 3], vertical_alignment="center"
             )
             badge_col.markdown(
-                f"<div style='background:{badge_color};color:#333;padding:2px 6px;"
-                f"border-radius:6px;font-size:16px;text-align:center;"
-                f"white-space:nowrap;font-family:NanumSquareNeo,sans-serif;'>"
-                f"{badge_date}</div>",
+                f"<span style='display:inline-block;background:{badge_color};color:#333;"
+                f"padding:4px 8px;border-radius:6px;font-size:16px;text-align:center;"
+                f"white-space:nowrap;font-family:NanumSquareNeo,sans-serif;"
+                f"vertical-align:middle;line-height:1;'>"
+                f"{badge_date}</span>",
                 unsafe_allow_html=True,
             )
             if title_col.button(
