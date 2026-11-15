@@ -476,7 +476,7 @@ def render_list(board_slug: str) -> None:
             )
             badge_col.markdown(
                 f"<div style='background:{badge_color};color:#333;padding:2px 6px;"
-                f"border-radius:6px;font-size:12px;text-align:center;"
+                f"border-radius:6px;font-size:16px;text-align:center;"
                 f"white-space:nowrap;font-family:NanumSquareNeo,sans-serif;'>"
                 f"{badge_date}</div>",
                 unsafe_allow_html=True,
