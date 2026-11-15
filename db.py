@@ -66,9 +66,10 @@ DEFAULT_CATEGORY: str = "자유"
 ALL_CATEGORY: str = "전체"
 
 BOARDS: dict[str, str] = {
+    "study": "공지 사항",
     "family": "우리 가족 게시판",
     "tips": "알아두면 좋은 정보",
-    "study": "공지사항",
+    
 }
 DEFAULT_BOARD: str = "family"
 BOARD_LABELS: tuple[str, ...] = tuple(BOARDS.values())
