@@ -90,7 +90,7 @@ section[data-testid="stSidebar"] [data-testid="stRadioOption"] div:not(:has(p)):
 }
 section[data-testid="stSidebar"] [data-testid="stRadioOption"] p {
     color: inherit;
-    font-size: 13px;
+    font-size: 18px;
 }
 section[data-testid="stSidebar"] [data-testid="stTextInputRootElement"] {
     height: 32px;
@@ -196,6 +196,19 @@ main[data-testid="stMain"] div[data-testid="stMainBlockContainer"] {
     }
     main[data-testid="stMain"] div[data-testid="stMainBlockContainer"] {
         padding: 56px 12px 80px;
+    }
+    /* 모바일에서 가로 블록(페이지네이션 등)이 넘치지 않도록 줄바꿈 허용 */
+    div[data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap !important;
+    }
+    div[data-testid="stColumn"] {
+        min-width: 0 !important;
+    }
+    /* 모바일 네비게이션 버튼 글자 크기 */
+    .mobile-nav-marker ~ * button,
+    section[data-testid="stMain"] button[kind="secondary"],
+    section[data-testid="stMain"] button[kind="primary"] {
+        font-size: 16px;
     }
 }
 /* 데스크톱에서는 모바일 상단 메뉴를 숨긴다. (임시: 빈 화면 방지를 위해 :has 규칙 제거) */
@@ -388,6 +401,10 @@ def _apply_branding() -> None:
             max-width: 100% !important;
             height: auto !important;
         }
+        img {
+            max-width: 100%;
+            height: auto;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -437,14 +454,14 @@ def _render_mobile_nav() -> None:
             '<span class="mobile-nav-marker"></span>', unsafe_allow_html=True
         )
         if LOGO_PATH.exists():
-            st.image(str(LOGO_PATH), width=240)
+            st.image(str(LOGO_PATH), width="stretch")
         columns = st.columns(3)
         for index, (label, slug) in enumerate(board_buttons):
             with columns[index]:
                 if st.button(
                     label,
                     key=f"mobile_board_{slug}",
-                    width=80,
+                    width="stretch",
                 ):
                     st.session_state.board = slug
                     st.session_state.page = 1
